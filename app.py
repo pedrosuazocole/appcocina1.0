@@ -1,135 +1,335 @@
 import streamlit as st
 import pandas as pd
 import os
+import ast
+import hashlib
 from datetime import datetime
-import ast  # Necesario para leer los detalles de la receta
 
-# 1. CONFIGURACIÓN E INSTALACIÓN DE DATOS
+# ── dependencias opcionales ──────────────────────────────────────────────────
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_OK = True
+except ImportError:
+    GSPREAD_OK = False
+
+# ════════════════════════════════════════════════════════════════════════════
+# 1. CONFIGURACION GENERAL
+# ════════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="Sistema Contable de Cocina", layout="wide")
-FILE_NAME = 'control_cocina_total.xlsx'
 
-def cargar_datos():
-    cols_art  = ["Codigo", "Nombre", "Unidad"]
-    cols_ing  = ["Codigo", "Ingrediente", "Unidad", "Stock", "Costo_Unitario"]
-    cols_rec  = ["Plato", "Detalle_Receta", "Costo_Total_Plato", "Precio_Venta",
-                 "Valor_Utilidad", "Margen_Utilidad", "Margen_Objetivo"]
-    cols_hist = ["Fecha_Factura", "No_Factura", "Codigo", "Producto", "Cantidad", "Costo_Total"]
-    cols_prod = ["Fecha", "ID", "Plato", "Cantidad", "Detalle"]  # CORRECCION BUG 1
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
-    if os.path.exists(FILE_NAME):
-        try:
-            art  = pd.read_excel(FILE_NAME, sheet_name='Catalogo')
-            ing  = pd.read_excel(FILE_NAME, sheet_name='Inventario')
-            rec  = pd.read_excel(FILE_NAME, sheet_name='Recetas')
-            hist = pd.read_excel(FILE_NAME, sheet_name='Historial')
+# Nombre de cada hoja dentro del Google Spreadsheet
+SHEETS = {
+    "catalogo":   "Catalogo",
+    "inventario": "Inventario",
+    "recetas":    "Recetas",
+    "historial":  "Historial",
+    "produccion": "Produccion",
+    "usuarios":   "Usuarios",
+}
 
-            # CORRECCION BUG 1: Cargar la hoja de Produccion al iniciar
-            try:
-                prod = pd.read_excel(FILE_NAME, sheet_name='Produccion')
-                prod = prod.drop_duplicates(subset='ID', keep='last').reset_index(drop=True)
-            except Exception:
-                prod = pd.DataFrame(columns=cols_prod)
+# Columnas por hoja
+COLS = {
+    "catalogo":   ["Codigo", "Nombre", "Unidad"],
+    "inventario": ["Codigo", "Ingrediente", "Unidad", "Stock", "Costo_Unitario"],
+    "recetas":    ["Plato", "Detalle_Receta", "Costo_Total_Plato", "Precio_Venta",
+                   "Valor_Utilidad", "Margen_Utilidad", "Margen_Objetivo"],
+    "historial":  ["Fecha_Factura", "No_Factura", "Codigo", "Producto", "Cantidad", "Costo_Total"],
+    "produccion": ["Fecha", "ID", "Plato", "Cantidad", "Detalle"],
+    "usuarios":   ["Usuario", "Password_Hash", "Rol", "Activo"],
+}
 
-            for col in cols_rec:
-                if col not in rec.columns:
-                    rec[col] = 0.0
+# ════════════════════════════════════════════════════════════════════════════
+# 2. AUTENTICACION GOOGLE SHEETS
+# ════════════════════════════════════════════════════════════════════════════
 
-            if 'Codigo' in art.columns:
-                art['Codigo'] = art['Codigo'].astype(str).str.zfill(3)
-            ing['Stock']          = pd.to_numeric(ing['Stock'],          errors='coerce').fillna(0.0).astype(float)
-            ing['Costo_Unitario'] = pd.to_numeric(ing['Costo_Unitario'], errors='coerce').fillna(0.0).astype(float)
+def get_gspread_client():
+    """Devuelve un cliente gspread autenticado con st.secrets."""
+    if not GSPREAD_OK:
+        return None
+    try:
+        creds = Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"], scopes=SCOPES
+        )
+        return gspread.authorize(creds)
+    except Exception:
+        return None
 
-            return art, ing, rec, hist, prod  # devuelve prod tambien
+def get_spreadsheet():
+    gc = get_gspread_client()
+    if gc is None:
+        return None
+    try:
+        return gc.open_by_key(st.secrets["spreadsheet_id"])
+    except Exception:
+        return None
 
-        except Exception as e:
-            st.error(f"Error al cargar el Excel: {e}")
+def get_worksheet(sheet_key: str):
+    """Devuelve la worksheet correspondiente, creándola si no existe."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return None
+    nombre = SHEETS[sheet_key]
+    try:
+        return ss.worksheet(nombre)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=nombre, rows=1000, cols=20)
+        ws.append_row(COLS[sheet_key])
+        return ws
 
-    return (pd.DataFrame(columns=cols_art),
-            pd.DataFrame(columns=cols_ing),
-            pd.DataFrame(columns=cols_rec),
-            pd.DataFrame(columns=cols_hist),
-            pd.DataFrame(columns=cols_prod))
+# ════════════════════════════════════════════════════════════════════════════
+# 3. LEER / ESCRIBIR GOOGLE SHEETS
+# ════════════════════════════════════════════════════════════════════════════
 
-# CORRECCION BUG 1: Desempacar los 5 valores y poblar historial_prod
-if 'catalogo' not in st.session_state:
+def leer_hoja(sheet_key: str) -> pd.DataFrame:
+    ws = get_worksheet(sheet_key)
+    if ws is None:
+        return pd.DataFrame(columns=COLS[sheet_key])
+    try:
+        data = ws.get_all_records(expected_headers=COLS[sheet_key])
+        if not data:
+            return pd.DataFrame(columns=COLS[sheet_key])
+        return pd.DataFrame(data)
+    except Exception:
+        return pd.DataFrame(columns=COLS[sheet_key])
+
+def escribir_hoja(sheet_key: str, df: pd.DataFrame):
+    ws = get_worksheet(sheet_key)
+    if ws is None:
+        return
+    try:
+        df_clean = df.fillna("").astype(str)
+        ws.clear()
+        ws.append_row(COLS[sheet_key])
+        if not df_clean.empty:
+            ws.append_rows(df_clean.values.tolist())
+    except Exception as e:
+        st.error(f"Error al guardar en Google Sheets ({sheet_key}): {e}")
+
+# ════════════════════════════════════════════════════════════════════════════
+# 4. UTILIDADES DE SEGURIDAD
+# ════════════════════════════════════════════════════════════════════════════
+
+def hash_password(pwd: str) -> str:
+    return hashlib.sha256(pwd.strip().encode()).hexdigest()
+
+def verificar_password(pwd: str, hash_stored: str) -> bool:
+    return hash_password(pwd) == hash_stored
+
+def crear_usuario_admin_defecto():
+    """Crea el usuario admin por defecto si la hoja Usuarios está vacía."""
+    df = st.session_state.get("usuarios", pd.DataFrame(columns=COLS["usuarios"]))
+    if df.empty:
+        nuevo = pd.DataFrame([{
+            "Usuario": "admin",
+            "Password_Hash": hash_password("admin123"),
+            "Rol": "Administrador",
+            "Activo": "True"
+        }])
+        st.session_state.usuarios = nuevo
+        escribir_hoja("usuarios", nuevo)
+
+# ════════════════════════════════════════════════════════════════════════════
+# 5. PERMISOS POR ROL
+# ════════════════════════════════════════════════════════════════════════════
+PERMISOS = {
+    "Administrador": ["cat", "inv", "rec", "prod", "rep", "usuarios"],
+    "Supervisor":    ["cat", "inv", "rec", "prod", "rep"],
+    "Cocina":        ["prod", "rep"],
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# 6. PANTALLA DE LOGIN
+# ════════════════════════════════════════════════════════════════════════════
+
+def pantalla_login():
+    col_c = st.columns([1, 2, 1])[1]
+    with col_c:
+        st.markdown("## 🍳 Sistema Contable de Cocina")
+        st.markdown("### Iniciar Sesión")
+        usuario = st.text_input("Usuario")
+        password = st.text_input("Contraseña", type="password")
+        if st.button("Ingresar", use_container_width=True, type="primary"):
+            df_u = st.session_state.get("usuarios", pd.DataFrame(columns=COLS["usuarios"]))
+            if df_u.empty:
+                st.error("No hay usuarios registrados. Contacte al administrador.")
+                return
+            fila = df_u[
+                (df_u["Usuario"].str.lower() == usuario.lower().strip()) &
+                (df_u["Activo"].astype(str).str.lower() == "true")
+            ]
+            if fila.empty:
+                st.error("Usuario no encontrado o inactivo.")
+                return
+            if not verificar_password(password, str(fila.iloc[0]["Password_Hash"])):
+                st.error("Contraseña incorrecta.")
+                return
+            st.session_state.logueado = True
+            st.session_state.usuario_actual = usuario.lower().strip()
+            st.session_state.rol_actual = fila.iloc[0]["Rol"]
+            st.rerun()
+
+# ════════════════════════════════════════════════════════════════════════════
+# 7. CARGAR TODOS LOS DATOS DESDE GOOGLE SHEETS
+# ════════════════════════════════════════════════════════════════════════════
+
+def cargar_todos():
+    art  = leer_hoja("catalogo")
+    ing  = leer_hoja("inventario")
+    rec  = leer_hoja("recetas")
+    hist = leer_hoja("historial")
+    prod = leer_hoja("produccion")
+    usu  = leer_hoja("usuarios")
+
+    # Normalizar tipos
+    if "Codigo" in art.columns:
+        art["Codigo"] = art["Codigo"].astype(str).str.zfill(3)
+
+    for col in ["Stock", "Costo_Unitario"]:
+        if col in ing.columns:
+            ing[col] = pd.to_numeric(ing[col], errors="coerce").fillna(0.0)
+
+    for col in COLS["recetas"]:
+        if col not in rec.columns:
+            rec[col] = 0.0
+
+    if not prod.empty and "ID" in prod.columns:
+        prod = prod.drop_duplicates(subset="ID", keep="last").reset_index(drop=True)
+
+    return art, ing, rec, hist, prod, usu
+
+def guardar_todo():
+    escribir_hoja("catalogo",   st.session_state.catalogo)
+    escribir_hoja("inventario", st.session_state.ingredientes)
+    escribir_hoja("recetas",    st.session_state.recetas)
+    escribir_hoja("historial",  st.session_state.historial)
+    if "historial_prod" in st.session_state:
+        escribir_hoja("produccion", st.session_state.historial_prod)
+    if "usuarios" in st.session_state:
+        escribir_hoja("usuarios", st.session_state.usuarios)
+
+def guardar_parcial(*sheet_keys):
+    mapping = {
+        "catalogo":   ("catalogo",   st.session_state.catalogo),
+        "inventario": ("inventario", st.session_state.ingredientes),
+        "recetas":    ("recetas",    st.session_state.recetas),
+        "historial":  ("historial",  st.session_state.historial),
+        "produccion": ("produccion", st.session_state.historial_prod),
+        "usuarios":   ("usuarios",   st.session_state.usuarios),
+    }
+    for key in sheet_keys:
+        if key in mapping:
+            escribir_hoja(mapping[key][0], mapping[key][1])
+
+# ════════════════════════════════════════════════════════════════════════════
+# 8. INICIALIZAR SESSION STATE
+# ════════════════════════════════════════════════════════════════════════════
+
+if "datos_cargados" not in st.session_state:
     (st.session_state.catalogo,
      st.session_state.ingredientes,
      st.session_state.recetas,
      st.session_state.historial,
-     st.session_state.historial_prod) = cargar_datos()
+     st.session_state.historial_prod,
+     st.session_state.usuarios) = cargar_todos()
+    crear_usuario_admin_defecto()
+    st.session_state.datos_cargados = True
 
-if 'factura_temporal' not in st.session_state:
+if "factura_temporal" not in st.session_state:
     st.session_state.factura_temporal = []
 
-def guardar():
-    try:
-        with pd.ExcelWriter(FILE_NAME) as writer:
-            st.session_state.catalogo.to_excel(      writer, sheet_name='Catalogo',   index=False)
-            st.session_state.ingredientes.to_excel(   writer, sheet_name='Inventario', index=False)
-            st.session_state.recetas.to_excel(         writer, sheet_name='Recetas',    index=False)
-            st.session_state.historial.to_excel(       writer, sheet_name='Historial',  index=False)
-            # CORRECCION BUG 1: guardar tambien la hoja de Produccion
-            if 'historial_prod' in st.session_state:
-                st.session_state.historial_prod.to_excel(writer, sheet_name='Produccion', index=False)
-    except Exception as e:
-        st.error(f"No se pudo guardar. Cierra el Excel si esta abierto. Error: {e}")
+if "logueado" not in st.session_state:
+    st.session_state.logueado = False
+    st.session_state.usuario_actual = ""
+    st.session_state.rol_actual = ""
 
-# FUNCION AUXILIAR: recalcula ingredientes desde historial + historial_prod
-# CORRECCION BUG 2 / BUG 3: logica centralizada y siempre actualizada
+# ════════════════════════════════════════════════════════════════════════════
+# 9. CONTROL DE ACCESO
+# ════════════════════════════════════════════════════════════════════════════
+
+if not st.session_state.logueado:
+    pantalla_login()
+    st.stop()
+
+rol = st.session_state.rol_actual
+permisos_rol = PERMISOS.get(rol, [])
+
+# ════════════════════════════════════════════════════════════════════════════
+# 10. FUNCIÓN AUXILIAR: recalcular ingredientes
+# ════════════════════════════════════════════════════════════════════════════
+
 def recalcular_ingredientes():
-    """Reconstruye st.session_state.ingredientes a partir de entradas (Historial)
-    y salidas (Produccion) para que el stock siempre sea coherente."""
     if st.session_state.historial.empty:
-        st.session_state.ingredientes = pd.DataFrame(
-            columns=['Codigo', 'Ingrediente', 'Unidad', 'Stock', 'Costo_Unitario'])
+        st.session_state.ingredientes = pd.DataFrame(columns=COLS["inventario"])
         return
 
     df_ent = st.session_state.historial.copy()
-    df_ent['Codigo'] = df_ent['Codigo'].astype(str).str.zfill(3)
-    df_ent[['Cantidad', 'Costo_Total']] = df_ent[['Cantidad', 'Costo_Total']].apply(pd.to_numeric, errors='coerce').fillna(0)
+    df_ent["Codigo"] = df_ent["Codigo"].astype(str).str.zfill(3)
+    df_ent[["Cantidad", "Costo_Total"]] = df_ent[["Cantidad", "Costo_Total"]].apply(
+        pd.to_numeric, errors="coerce").fillna(0)
 
-    resumen = df_ent.groupby(['Codigo', 'Producto', 'Unidad']).agg(
-        {'Cantidad': 'sum', 'Costo_Total': 'sum'}).reset_index()
-    resumen['Codigo'] = resumen['Codigo'].astype(str).str.zfill(3)
-    resumen['Costo_Unitario'] = resumen.apply(
-        lambda r: r['Costo_Total'] / r['Cantidad'] if r['Cantidad'] > 0 else 0, axis=1)
+    resumen = df_ent.groupby(["Codigo", "Producto", "Unidad"]).agg(
+        {"Cantidad": "sum", "Costo_Total": "sum"}).reset_index()
+    resumen["Codigo"] = resumen["Codigo"].astype(str).str.zfill(3)
+    resumen["Costo_Unitario"] = resumen.apply(
+        lambda r: r["Costo_Total"] / r["Cantidad"] if r["Cantidad"] > 0 else 0, axis=1)
 
-    # Calcular salidas desde historial_prod
     salidas = {}
-    if 'historial_prod' in st.session_state and not st.session_state.historial_prod.empty:
+    if "historial_prod" in st.session_state and not st.session_state.historial_prod.empty:
         for _, fila in st.session_state.historial_prod.iterrows():
             try:
-                insumos = ast.literal_eval(str(fila['Detalle']))
+                insumos = ast.literal_eval(str(fila["Detalle"]))
                 for ins in insumos:
-                    cod = str(ins['Codigo']).zfill(3)
-                    salidas[cod] = salidas.get(cod, 0) + float(ins['Cantidad']) * float(fila['Cantidad'])
+                    cod = str(ins["Codigo"]).zfill(3)
+                    salidas[cod] = salidas.get(cod, 0) + float(ins["Cantidad"]) * float(fila["Cantidad"])
             except Exception:
                 pass
 
-    resumen['Salidas'] = resumen['Codigo'].map(salidas).fillna(0)
-    resumen['Stock']   = resumen['Cantidad'] - resumen['Salidas']
+    resumen["Salidas"] = resumen["Codigo"].map(salidas).fillna(0)
+    resumen["Stock"]   = resumen["Cantidad"] - resumen["Salidas"]
 
     st.session_state.ingredientes = resumen[
-        ['Codigo', 'Producto', 'Unidad', 'Stock', 'Costo_Unitario']
-    ].rename(columns={'Producto': 'Ingrediente'})
+        ["Codigo", "Producto", "Unidad", "Stock", "Costo_Unitario"]
+    ].rename(columns={"Producto": "Ingrediente"})
 
+# ════════════════════════════════════════════════════════════════════════════
+# 11. MENU LATERAL
+# ════════════════════════════════════════════════════════════════════════════
 
-# 2. MENU LATERAL
-st.sidebar.header("MENU PRINCIPAL")
-opciones_menu = {
-    "cat":  "Lista de Articulos (Maestro)",
-    "inv":  "Inventario/Compras (Facturas)",
-    "rec":  "Crear Receta",
-    "prod": "Produccion",
-    "rep":  "Informes"
+OPCIONES_MENU = {
+    "cat":      "Lista de Articulos (Maestro)",
+    "inv":      "Inventario/Compras (Facturas)",
+    "rec":      "Crear Receta",
+    "prod":     "Produccion",
+    "rep":      "Informes",
+    "usuarios": "Gestion de Usuarios",
 }
-seleccion_texto = st.sidebar.radio("Ir a:", list(opciones_menu.values()))
-opid = [k for k, v in opciones_menu.items() if v == seleccion_texto][0]
 
-st.title(f"{seleccion_texto}")
+opciones_visibles = {k: v for k, v in OPCIONES_MENU.items() if k in permisos_rol}
+
+st.sidebar.header("MENU PRINCIPAL")
+st.sidebar.markdown(f"👤 **{st.session_state.usuario_actual}** ({rol})")
+
+seleccion_texto = st.sidebar.radio("Ir a:", list(opciones_visibles.values()))
+opid = [k for k, v in opciones_visibles.items() if v == seleccion_texto][0]
+
+if st.sidebar.button("🚪 Cerrar Sesión", use_container_width=True):
+    st.session_state.logueado = False
+    st.session_state.usuario_actual = ""
+    st.session_state.rol_actual = ""
+    st.rerun()
+
+st.title(seleccion_texto)
 st.markdown("---")
 
-# 3. LOGICA DE PANTALLAS
+# ════════════════════════════════════════════════════════════════════════════
+# 12. MÓDULO: LISTA DE ARTÍCULOS
+# ════════════════════════════════════════════════════════════════════════════
 
 if opid == "cat":
     t1, t2 = st.tabs(["Registrar", "Modificar"])
@@ -144,7 +344,7 @@ if opid == "cat":
                         [st.session_state.catalogo,
                          pd.DataFrame([{"Codigo": nuevo_cod, "Nombre": n_art, "Unidad": u_art}])],
                         ignore_index=True)
-                    guardar()
+                    guardar_parcial("catalogo")
                     st.success(f"Creado: {nuevo_cod}")
                     st.rerun()
     with t2:
@@ -152,27 +352,27 @@ if opid == "cat":
             art_m = st.selectbox("Seleccione articulo",
                                  [f"{r['Codigo']} - {r['Nombre']}" for _, r in st.session_state.catalogo.iterrows()])
             c_m  = art_m.split(" - ")[0]
-            idx  = st.session_state.catalogo.index[st.session_state.catalogo['Codigo'] == c_m].tolist()[0]
+            idx  = st.session_state.catalogo.index[st.session_state.catalogo["Codigo"] == c_m].tolist()[0]
             with st.form("f_edit_c"):
-                n_n = st.text_input("Nuevo Nombre",  value=st.session_state.catalogo.at[idx, 'Nombre']).upper()
-                n_u = st.selectbox("Nueva Unidad",   ["Unidad", "Libra", "Kg", "Litro", "Onza"],
+                n_n = st.text_input("Nuevo Nombre", value=st.session_state.catalogo.at[idx, "Nombre"]).upper()
+                n_u = st.selectbox("Nueva Unidad", ["Unidad", "Libra", "Kg", "Litro", "Onza"],
                                    index=["Unidad", "Libra", "Kg", "Litro", "Onza"].index(
-                                       st.session_state.catalogo.at[idx, 'Unidad']))
+                                       st.session_state.catalogo.at[idx, "Unidad"]))
                 if st.form_submit_button("Actualizar"):
-                    st.session_state.catalogo.at[idx, 'Nombre'] = n_n
-                    st.session_state.catalogo.at[idx, 'Unidad'] = n_u
-                    guardar()
+                    st.session_state.catalogo.at[idx, "Nombre"] = n_n
+                    st.session_state.catalogo.at[idx, "Unidad"] = n_u
+                    guardar_parcial("catalogo")
                     st.success("Actualizado")
                     st.rerun()
     st.dataframe(st.session_state.catalogo, use_container_width=True, hide_index=True)
 
-elif opid == "inv":
-    # CORRECCION BUG 2: usar la funcion centralizada
-    recalcular_ingredientes()
+# ════════════════════════════════════════════════════════════════════════════
+# 13. MÓDULO: INVENTARIO / COMPRAS
+# ════════════════════════════════════════════════════════════════════════════
 
-    tab1, tab2, tab3 = st.tabs(["Registrar/Editar Compra",
-                                 "Gestionar Historial/Inventario",
-                                 "Kardex Detallado"])
+elif opid == "inv":
+    recalcular_ingredientes()
+    tab1, tab2, tab3 = st.tabs(["Registrar/Editar Compra", "Gestionar Historial/Inventario", "Kardex Detallado"])
 
     with tab1:
         st.markdown("### Datos de la Factura")
@@ -190,8 +390,8 @@ elif opid == "inv":
             df_cat = st.session_state.catalogo[
                 st.session_state.catalogo["Codigo"].astype(str).str.zfill(3) == cod_s]
             if not df_cat.empty:
-                u_act = df_cat.iloc[0]['Unidad']
-                nom_p = df_cat.iloc[0]['Nombre']
+                u_act = df_cat.iloc[0]["Unidad"]
+                nom_p = df_cat.iloc[0]["Nombre"]
 
         c1, c2, c3, c4 = st.columns(4)
         c1.text_input("Unidad", value=u_act, disabled=True)
@@ -219,14 +419,14 @@ elif opid == "inv":
             col_b1, col_b2 = st.columns(2)
             if col_b1.button("PROCESAR FACTURA E INVENTARIO", type="primary", use_container_width=True):
                 st.session_state.historial = st.session_state.historial[
-                    st.session_state.historial['No_Factura'] != f_num]
+                    st.session_state.historial["No_Factura"] != f_num]
                 for it in st.session_state.factura_temporal:
-                    nueva_f = pd.DataFrame([{**it, "Fecha_Factura": f_fecha, "No_Factura": f_num}])
+                    nueva_f = pd.DataFrame([{**it, "Fecha_Factura": str(f_fecha), "No_Factura": f_num}])
                     st.session_state.historial = pd.concat(
                         [st.session_state.historial, nueva_f], ignore_index=True)
-                guardar()
+                guardar_parcial("historial")
                 st.session_state.factura_temporal = []
-                st.success(f"Exito! La Factura {f_num} ha sido agregada al inventario correctamente.")
+                st.success(f"Exito! La Factura {f_num} ha sido agregada al inventario.")
                 st.rerun()
 
             if col_b2.button("Cancelar Factura", use_container_width=True):
@@ -237,8 +437,8 @@ elif opid == "inv":
         st.markdown("### Inventario Fisico Real")
         if not st.session_state.ingredientes.empty:
             df_vis = st.session_state.ingredientes.copy()
-            df_vis['Valor_Total'] = df_vis['Stock'] * df_vis['Costo_Unitario']
-            st.dataframe(df_vis.rename(columns={'Costo_Unitario': 'Costo Prom.'}),
+            df_vis["Valor_Total"] = pd.to_numeric(df_vis["Stock"], errors="coerce") * pd.to_numeric(df_vis["Costo_Unitario"], errors="coerce")
+            st.dataframe(df_vis.rename(columns={"Costo_Unitario": "Costo Prom."}),
                          hide_index=True, use_container_width=True)
             st.info(f"Valor Total de Inversion en Bodega: L. {df_vis['Valor_Total'].sum():.2f}")
 
@@ -251,62 +451,59 @@ elif opid == "inv":
         if not st.session_state.historial.empty:
             df_hist = st.session_state.historial.copy()
             if busq_n:
-                df_hist = df_hist[df_hist['No_Factura'].astype(str).str.contains(busq_n, case=False)]
+                df_hist = df_hist[df_hist["No_Factura"].astype(str).str.contains(busq_n, case=False)]
             if busq_f:
-                df_hist = df_hist[pd.to_datetime(df_hist['Fecha_Factura']).dt.date == busq_f]
+                df_hist = df_hist[pd.to_datetime(df_hist["Fecha_Factura"], errors="coerce").dt.date == busq_f]
 
             for n_f, grp in df_hist.groupby("No_Factura"):
                 with st.expander(
                     f"Factura: {n_f} | Fecha: {grp.iloc[0]['Fecha_Factura']} | "
-                    f"Total: L. {grp['Costo_Total'].sum():.2f}"):
-                    st.dataframe(grp[['Codigo', 'Producto', 'Cantidad', 'Costo_Unitario', 'Costo_Total']],
+                    f"Total: L. {pd.to_numeric(grp['Costo_Total'], errors='coerce').sum():.2f}"):
+                    st.dataframe(grp[["Codigo", "Producto", "Cantidad", "Costo_Unitario", "Costo_Total"]],
                                  hide_index=True)
                     c_ed1, c_ed2, c_ed3 = st.columns([0.3, 0.4, 0.3])
 
                     if c_ed1.button(f"Modificar", key=f"mod_{n_f}"):
                         st.session_state.factura_temporal = grp[
-                            ['Codigo', 'Producto', 'Unidad', 'Cantidad', 'Costo_Unitario', 'Costo_Total']
-                        ].to_dict('records')
+                            ["Codigo", "Producto", "Unidad", "Cantidad", "Costo_Unitario", "Costo_Total"]
+                        ].to_dict("records")
                         st.info("Cargado en 'Registrar'. Haga sus cambios y guarde.")
 
                     confirmar = c_ed2.checkbox(f"Confirmar eliminar {n_f}", key=f"chk_{n_f}")
-                    if c_ed3.button(f"ELIMINAR", key=f"del_{n_f}",
-                                    type="secondary", disabled=not confirmar):
+                    if c_ed3.button(f"ELIMINAR", key=f"del_{n_f}", type="secondary", disabled=not confirmar):
                         st.session_state.historial = st.session_state.historial[
-                            st.session_state.historial['No_Factura'] != n_f]
-                        guardar()
+                            st.session_state.historial["No_Factura"] != n_f]
+                        guardar_parcial("historial")
                         st.rerun()
 
     with tab3:
         st.subheader("Kardex Detallado por Producto")
-        # CORRECCION BUG 3: op_p definido localmente para evitar error de variable no definida
         op_p_k = ["SELECCIONE PRODUCTO"] + [f"{r['Codigo']} - {r['Nombre']}"
                                               for _, r in st.session_state.catalogo.iterrows()]
         insumo_k = st.selectbox("Seleccione Producto:", op_p_k, key="k_p_sel")
 
         if insumo_k != "SELECCIONE PRODUCTO":
             c_k   = insumo_k.split(" - ")[0].zfill(3)
-            # Obtener unidad del catalogo directamente
             df_cat_k = st.session_state.catalogo[
-                st.session_state.catalogo['Codigo'].astype(str).str.zfill(3) == c_k]
-            u_kardex = df_cat_k.iloc[0]['Unidad'] if not df_cat_k.empty else "---"
+                st.session_state.catalogo["Codigo"].astype(str).str.zfill(3) == c_k]
+            u_kardex = df_cat_k.iloc[0]["Unidad"] if not df_cat_k.empty else "---"
 
             m_ent = st.session_state.historial[
-                st.session_state.historial['Codigo'].astype(str).str.zfill(3) == c_k].copy()
+                st.session_state.historial["Codigo"].astype(str).str.zfill(3) == c_k].copy()
 
             m_sal = pd.DataFrame()
-            if 'historial_prod' in st.session_state and not st.session_state.historial_prod.empty:
+            if "historial_prod" in st.session_state and not st.session_state.historial_prod.empty:
                 sal_rows = []
                 for _, fila_prod in st.session_state.historial_prod.iterrows():
                     try:
-                        insumos = ast.literal_eval(str(fila_prod['Detalle']))
+                        insumos = ast.literal_eval(str(fila_prod["Detalle"]))
                         for ins in insumos:
-                            if str(ins['Codigo']).zfill(3) == c_k:
+                            if str(ins["Codigo"]).zfill(3) == c_k:
                                 sal_rows.append({
-                                    'Fecha': fila_prod['Fecha'],
-                                    'Ref':   f"PROD {fila_prod['ID']} - {fila_prod['Plato']}",
-                                    'Cantidad':      float(ins['Cantidad']) * float(fila_prod['Cantidad']),
-                                    'Costo_Unitario': float(ins.get('Costo_U', 0))
+                                    "Fecha": fila_prod["Fecha"],
+                                    "Ref":   f"PROD {fila_prod['ID']} - {fila_prod['Plato']}",
+                                    "Cantidad": float(ins["Cantidad"]) * float(fila_prod["Cantidad"]),
+                                    "Costo_Unitario": float(ins.get("Costo_U", 0))
                                 })
                     except Exception:
                         pass
@@ -315,54 +512,55 @@ elif opid == "inv":
 
             k_list = []
             for _, r in m_ent.iterrows():
-                k_list.append({'Fecha': r['Fecha_Factura'],
-                                'Ref': f"Fact: {r['No_Factura']}",
-                                'E': float(r['Cantidad']),
-                                'S': 0.0,
-                                'Total': float(r['Costo_Total'])})
+                k_list.append({"Fecha": r["Fecha_Factura"],
+                                "Ref": f"Fact: {r['No_Factura']}",
+                                "E": float(r["Cantidad"]) if str(r["Cantidad"]).replace(".","").isdigit() else 0,
+                                "S": 0.0,
+                                "Total": float(r["Costo_Total"]) if str(r["Costo_Total"]).replace(".","").isdigit() else 0})
             for _, r in m_sal.iterrows():
-                k_list.append({'Fecha': r['Fecha'],
-                                'Ref':  r['Ref'],
-                                'E':    0.0,
-                                'S':    float(r['Cantidad']),
-                                'Total': -(float(r['Cantidad']) * float(r.get('Costo_Unitario', 0)))})
+                k_list.append({"Fecha": r["Fecha"],
+                                "Ref":  r["Ref"],
+                                "E":    0.0,
+                                "S":    float(r["Cantidad"]),
+                                "Total": -(float(r["Cantidad"]) * float(r.get("Costo_Unitario", 0)))})
 
             if k_list:
                 df_k = pd.DataFrame(k_list)
-                # CORRECCION: normalizar fechas a datetime para poder ordenar
-                # (Historial guarda Timestamp, Produccion guarda string)
-                df_k['Fecha'] = pd.to_datetime(df_k['Fecha'], errors='coerce')
-                df_k = df_k.sort_values('Fecha')
+                df_k["Fecha"] = pd.to_datetime(df_k["Fecha"], errors="coerce")
+                df_k = df_k.sort_values("Fecha")
                 stock_a, valor_a, filas = 0.0, 0.0, []
                 for _, m in df_k.iterrows():
-                    stock_a += (m['E'] - m['S'])
-                    valor_a += m['Total']
+                    stock_a += (m["E"] - m["S"])
+                    valor_a += m["Total"]
                     filas.append({
-                        'Fecha':     m['Fecha'],
-                        'Ref':       m['Ref'],
-                        'Unidad':    u_kardex,
-                        'Entrada':   m['E'],
-                        'Salida':    m['S'],
-                        'Existencia': stock_a,
-                        'C. Prom':   valor_a / stock_a if stock_a > 0 else 0,
-                        'V. Total':  valor_a
+                        "Fecha":      m["Fecha"],
+                        "Ref":        m["Ref"],
+                        "Unidad":     u_kardex,
+                        "Entrada":    m["E"],
+                        "Salida":     m["S"],
+                        "Existencia": stock_a,
+                        "C. Prom":    valor_a / stock_a if stock_a > 0 else 0,
+                        "V. Total":   valor_a
                     })
-
                 final_k = pd.DataFrame(filas)
                 st.dataframe(final_k, hide_index=True, use_container_width=True)
 
                 import io
                 output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    final_k.to_excel(writer, index=False, sheet_name='Kardex')
+                with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                    final_k.to_excel(writer, index=False, sheet_name="Kardex")
                 st.download_button("Descargar Kardex a Excel", output.getvalue(), f"Kardex_{c_k}.xlsx")
             else:
                 st.info("No hay movimientos registrados para este producto.")
 
+# ════════════════════════════════════════════════════════════════════════════
+# 14. MÓDULO: RECETAS
+# ════════════════════════════════════════════════════════════════════════════
+
 elif opid == "rec":
     t_crear, t_ver = st.tabs(["Crear / Editar Receta", "Ver Recetario"])
 
-    if 'edit_rec_data' not in st.session_state:
+    if "edit_rec_data" not in st.session_state:
         st.session_state.edit_rec_data = None
 
     with t_crear:
@@ -370,11 +568,11 @@ elif opid == "rec":
         val_nombre, val_precio, val_margen, val_insumos = "", 0.0, 70.0, []
 
         if st.session_state.edit_rec_data:
-            val_nombre = st.session_state.edit_rec_data['Plato']
-            val_precio = float(st.session_state.edit_rec_data['Precio_Venta'])
-            val_margen = float(st.session_state.edit_rec_data['Margen_Objetivo'] * 100)
+            val_nombre = st.session_state.edit_rec_data["Plato"]
+            val_precio = float(st.session_state.edit_rec_data["Precio_Venta"])
+            val_margen = float(st.session_state.edit_rec_data["Margen_Objetivo"]) * 100
             try:
-                items_edit = ast.literal_eval(st.session_state.edit_rec_data['Detalle_Receta'])
+                items_edit = ast.literal_eval(str(st.session_state.edit_rec_data["Detalle_Receta"]))
                 val_insumos = [f"{i['Codigo']} - {i['Nombre']}" for i in items_edit]
             except Exception:
                 pass
@@ -402,27 +600,26 @@ elif opid == "rec":
                     val_cant = 0.1
                     if st.session_state.edit_rec_data:
                         try:
-                            items_e = ast.literal_eval(st.session_state.edit_rec_data['Detalle_Receta'])
+                            items_e = ast.literal_eval(str(st.session_state.edit_rec_data["Detalle_Receta"]))
                             for ie in items_e:
-                                if str(ie['Codigo']).zfill(3) == str(datos['Codigo']).zfill(3):
-                                    val_cant = float(ie['Cantidad'])
+                                if str(ie["Codigo"]).zfill(3) == str(datos["Codigo"]).zfill(3):
+                                    val_cant = float(ie["Cantidad"])
                         except Exception:
                             pass
 
                     col1, col2, col3, col4 = st.columns(4)
                     with col1: st.markdown(f"**{datos['Ingrediente']}**")
-                    with col2: cant_rec = st.number_input(f"Cant ({datos['Unidad']})",
-                                                           min_value=0.01, step=0.1,
-                                                           value=val_cant,
-                                                           key=f"q_{datos['Codigo']}")
-                    with col3: st.write(f"Costo P: L.{datos['Costo_Unitario']:.2f}")
-                    with col4:
-                        subt = cant_rec * datos['Costo_Unitario']
-                        st.write(f"Sub: L.{subt:.2f}")
+                    with col2:
+                        cant_rec = st.number_input(f"Cant ({datos['Unidad']})",
+                                                   min_value=0.01, step=0.1, value=val_cant,
+                                                   key=f"q_{datos['Codigo']}")
+                    cu = float(datos["Costo_Unitario"]) if str(datos["Costo_Unitario"]).replace(".","").isdigit() else 0.0
+                    with col3: st.write(f"Costo P: L.{cu:.2f}")
+                    subt = cant_rec * cu
+                    with col4: st.write(f"Sub: L.{subt:.2f}")
                     costo_materia_prima += subt
-                    detalle_final.append({"Codigo": datos['Codigo'], "Nombre": datos['Ingrediente'],
-                                          "Cantidad": cant_rec, "Costo_U": datos['Costo_Unitario'],
-                                          "Subtotal": subt})
+                    detalle_final.append({"Codigo": datos["Codigo"], "Nombre": datos["Ingrediente"],
+                                          "Cantidad": cant_rec, "Costo_U": cu, "Subtotal": subt})
 
                 st.divider()
                 val_utilidad  = p_venta - costo_materia_prima
@@ -443,7 +640,7 @@ elif opid == "rec":
                     if n_plato and p_venta > 0 and detalle_final:
                         if not st.session_state.recetas.empty:
                             st.session_state.recetas = st.session_state.recetas[
-                                st.session_state.recetas['Plato'] != n_plato]
+                                st.session_state.recetas["Plato"] != n_plato]
                         nueva_rec = pd.DataFrame([{
                             "Plato": n_plato, "Detalle_Receta": str(detalle_final),
                             "Costo_Total_Plato": costo_materia_prima,
@@ -452,7 +649,7 @@ elif opid == "rec":
                         }])
                         st.session_state.recetas = pd.concat(
                             [st.session_state.recetas, nueva_rec], ignore_index=True)
-                        guardar()
+                        guardar_parcial("recetas")
                         st.session_state.edit_rec_data = None
                         st.success("Receta guardada")
                         st.rerun()
@@ -466,24 +663,23 @@ elif opid == "rec":
         if not st.session_state.recetas.empty:
             for idx, r in st.session_state.recetas.iterrows():
                 with st.expander(f"Plato: {r['Plato']} | L.{r['Precio_Venta']}"):
-                    items = ast.literal_eval(r['Detalle_Receta'])
-                    st.table(pd.DataFrame(items)[['Nombre', 'Cantidad', 'Costo_U', 'Subtotal']])
-
+                    try:
+                        items = ast.literal_eval(str(r["Detalle_Receta"]))
+                        st.table(pd.DataFrame(items)[["Nombre", "Cantidad", "Costo_U", "Subtotal"]])
+                    except Exception:
+                        st.write(r["Detalle_Receta"])
                     st.markdown(f"""
-                    **RESUMEN:** Precio Venta: **L.{r['Precio_Venta']:.2f}** |
-                    Costo Total: **L.{r['Costo_Total_Plato']:.2f}** |
-                    Utilidad: **L.{r['Valor_Utilidad']:.2f}** |
-                    Margen Real: **{r['Margen_Utilidad']*100:.1f}%** |
-                    Margen Obj: **{r['Margen_Objetivo']*100:.1f}%**
+                    **RESUMEN:** Precio Venta: **L.{float(r['Precio_Venta']):.2f}** |
+                    Costo Total: **L.{float(r['Costo_Total_Plato']):.2f}** |
+                    Utilidad: **L.{float(r['Valor_Utilidad']):.2f}** |
+                    Margen Real: **{float(r['Margen_Utilidad'])*100:.1f}%** |
+                    Margen Obj: **{float(r['Margen_Objetivo'])*100:.1f}%**
                     """)
-
                     st.write("---")
                     c1, c2 = st.columns(2)
-
                     if c1.button(f"Editar {r['Plato']}", key=f"btn_edit_{idx}"):
                         st.session_state.edit_rec_data = r.to_dict()
-                        st.success(f"Datos de '{r['Plato']}' cargados. "
-                                   "Por favor, regrese a la pestana 'Crear / Editar Receta'.")
+                        st.success(f"Datos de '{r['Plato']}' cargados. Regrese a 'Crear / Editar Receta'.")
 
                     if f"confirm_del_rec_{idx}" not in st.session_state:
                         st.session_state[f"confirm_del_rec_{idx}"] = False
@@ -497,7 +693,7 @@ elif opid == "rec":
                         col_si, col_no = st.columns(2)
                         if col_si.button("Confirmar", key=f"conf_si_rec_{idx}"):
                             st.session_state.recetas = st.session_state.recetas.drop(idx)
-                            guardar()
+                            guardar_parcial("recetas")
                             st.session_state[f"confirm_del_rec_{idx}"] = False
                             st.rerun()
                         if col_no.button("Cancelar", key=f"conf_no_rec_{idx}"):
@@ -506,45 +702,44 @@ elif opid == "rec":
         else:
             st.info("No hay recetas registradas.")
 
+# ════════════════════════════════════════════════════════════════════════════
+# 15. MÓDULO: PRODUCCIÓN
+# ════════════════════════════════════════════════════════════════════════════
+
 elif opid == "prod":
     t_orden, t_hist_prod = st.tabs(["Generar Orden de Produccion", "Historial de Produccion"])
 
-    # historial_prod ya se carga en cargar_datos(); este bloque es solo fallback
-    if 'historial_prod' not in st.session_state:
-        st.session_state.historial_prod = pd.DataFrame(columns=["Fecha", "ID", "Plato", "Cantidad", "Detalle"])
+    if "historial_prod" not in st.session_state:
+        st.session_state.historial_prod = pd.DataFrame(columns=COLS["produccion"])
 
     with t_orden:
         st.subheader("Nueva Orden de Produccion")
         if st.session_state.recetas.empty:
             st.warning("No hay recetas creadas. Vaya al modulo 'Crear Receta' primero.")
         else:
-            # Recalcular stock antes de mostrar disponibilidad
             recalcular_ingredientes()
-
             with st.container(border=True):
                 c_p1, c_p2 = st.columns(2)
-                lista_platos = st.session_state.recetas['Plato'].tolist()
+                lista_platos = st.session_state.recetas["Plato"].tolist()
                 plato_p = c_p1.selectbox("Seleccione el Plato a Producir", [""] + lista_platos)
                 cant_p  = c_p2.number_input("Cantidad de Platos/Porciones", min_value=1, step=1)
 
             if plato_p:
-                receta_info    = st.session_state.recetas[st.session_state.recetas['Plato'] == plato_p].iloc[0]
-                insumos_receta = ast.literal_eval(receta_info['Detalle_Receta'])
-
+                receta_info    = st.session_state.recetas[st.session_state.recetas["Plato"] == plato_p].iloc[0]
+                insumos_receta = ast.literal_eval(str(receta_info["Detalle_Receta"]))
                 resumen_descuento = []
                 puede_procesar    = True
 
                 for ins in insumos_receta:
-                    total_necesario = float(ins['Cantidad']) * float(cant_p)
-                    idx_inv    = st.session_state.ingredientes[
-                        st.session_state.ingredientes['Codigo'] == ins['Codigo']].index
-                    stock_actual = float(st.session_state.ingredientes.at[idx_inv[0], 'Stock']) \
+                    total_necesario = float(ins["Cantidad"]) * float(cant_p)
+                    idx_inv = st.session_state.ingredientes[
+                        st.session_state.ingredientes["Codigo"] == ins["Codigo"]].index
+                    stock_actual = float(st.session_state.ingredientes.at[idx_inv[0], "Stock"]) \
                                    if not idx_inv.empty else 0.0
-
                     if stock_actual < total_necesario:
                         puede_procesar = False
                     resumen_descuento.append({
-                        "Insumo":       ins['Nombre'],
+                        "Insumo":       ins["Nombre"],
                         "Necesario":    round(total_necesario, 4),
                         "Stock Actual": round(stock_actual, 4),
                         "Estado":       "OK" if stock_actual >= total_necesario else "Sin Stock"
@@ -557,29 +752,23 @@ elif opid == "prod":
                     id_prod   = f"PROD-{datetime.now().strftime('%H%M%S%f')[:13]}"
                     fecha_hoy = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-                    # 1. DESCONTAR STOCK EN TABLA MAESTRA
-                    st.session_state.ingredientes['Stock'] = \
-                        st.session_state.ingredientes['Stock'].astype(float)
+                    st.session_state.ingredientes["Stock"] = st.session_state.ingredientes["Stock"].astype(float)
                     for ins in insumos_receta:
-                        total_n = float(ins['Cantidad']) * float(cant_p)
-                        idx_i   = st.session_state.ingredientes[
-                            st.session_state.ingredientes['Codigo'] == ins['Codigo']].index
+                        total_n = float(ins["Cantidad"]) * float(cant_p)
+                        idx_i = st.session_state.ingredientes[
+                            st.session_state.ingredientes["Codigo"] == ins["Codigo"]].index
                         if not idx_i.empty:
-                            st.session_state.ingredientes.at[idx_i[0], 'Stock'] -= total_n
+                            st.session_state.ingredientes.at[idx_i[0], "Stock"] -= total_n
 
-                    # 2. REGISTRAR EN HISTORIAL DE PRODUCCION
                     nueva_fila_prod = pd.DataFrame([{
-                        "Fecha":    fecha_hoy,
-                        "ID":       id_prod,
-                        "Plato":    plato_p,
-                        "Cantidad": cant_p,
-                        "Detalle":  str(insumos_receta)
+                        "Fecha": fecha_hoy, "ID": id_prod,
+                        "Plato": plato_p, "Cantidad": cant_p,
+                        "Detalle": str(insumos_receta)
                     }])
                     st.session_state.historial_prod = pd.concat(
                         [st.session_state.historial_prod, nueva_fila_prod], ignore_index=True)
 
-                    # 3. GUARDAR TODO (guardar() ya incluye la hoja Produccion)
-                    guardar()
+                    guardar_parcial("produccion", "inventario")
                     st.success(f"Produccion registrada. ID: {id_prod}")
                     st.balloons()
                     st.rerun()
@@ -590,45 +779,46 @@ elif opid == "prod":
             busq = st.text_input("Buscar por plato:").upper()
             df_h = st.session_state.historial_prod.copy()
             if busq:
-                df_h = df_h[df_h['Plato'].str.contains(busq)]
+                df_h = df_h[df_h["Plato"].str.contains(busq)]
 
             for idx, row in df_h.iterrows():
                 with st.expander(f"{row['Fecha']} | {row['Plato']} | Cant: {row['Cantidad']}"):
                     st.write(f"ID Operacion: {row['ID']}")
-
                     if st.button(f"Eliminar y Revertir Stock", key=f"del_p_{row['ID']}"):
-                        ins_rev = ast.literal_eval(str(row['Detalle']))
+                        ins_rev = ast.literal_eval(str(row["Detalle"]))
                         for i_r in ins_rev:
-                            total_r = float(i_r['Cantidad']) * float(row['Cantidad'])
+                            total_r = float(i_r["Cantidad"]) * float(row["Cantidad"])
                             idx_inv = st.session_state.ingredientes[
-                                st.session_state.ingredientes['Codigo'] == i_r['Codigo']].index
+                                st.session_state.ingredientes["Codigo"] == i_r["Codigo"]].index
                             if not idx_inv.empty:
-                                st.session_state.ingredientes.at[idx_inv[0], 'Stock'] += total_r
+                                st.session_state.ingredientes.at[idx_inv[0], "Stock"] += total_r
 
                         st.session_state.historial_prod = \
                             st.session_state.historial_prod.drop(idx).reset_index(drop=True)
-                        guardar()
+                        guardar_parcial("produccion", "inventario")
                         st.warning("Produccion eliminada y stock restaurado.")
                         st.rerun()
         else:
             st.info("No hay registros de produccion.")
 
+# ════════════════════════════════════════════════════════════════════════════
+# 16. MÓDULO: INFORMES
+# ════════════════════════════════════════════════════════════════════════════
+
 elif opid == "rep":
     st.subheader("Panel de Control y Analisis")
-
-    # Asegurar stock actualizado antes de mostrar reportes
     recalcular_ingredientes()
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        total_inv = (st.session_state.ingredientes['Stock'] *
-                     st.session_state.ingredientes['Costo_Unitario']).sum() \
+        total_inv = (pd.to_numeric(st.session_state.ingredientes["Stock"], errors="coerce") *
+                     pd.to_numeric(st.session_state.ingredientes["Costo_Unitario"], errors="coerce")).sum() \
                     if not st.session_state.ingredientes.empty else 0
         st.metric("Inversion en Bodega", f"L. {total_inv:,.2f}")
     with c2:
         st.metric("Recetas Activas", len(st.session_state.recetas))
     with c3:
-        margen_prom = st.session_state.recetas['Margen_Utilidad'].mean() * 100 \
+        margen_prom = pd.to_numeric(st.session_state.recetas["Margen_Utilidad"], errors="coerce").mean() * 100 \
                       if not st.session_state.recetas.empty else 0
         st.metric("Margen Promedio", f"{margen_prom:.1f}%")
 
@@ -638,12 +828,11 @@ elif opid == "rep":
     with col_izq:
         st.write("### Alertas de Reabastecimiento")
         bajo_stock = st.session_state.ingredientes[
-            st.session_state.ingredientes['Stock'] < 5].copy()
+            pd.to_numeric(st.session_state.ingredientes["Stock"], errors="coerce") < 5].copy()
 
         if not bajo_stock.empty:
             st.warning(f"Hay {len(bajo_stock)} insumos por agotarse.")
-            st.dataframe(bajo_stock[['Ingrediente', 'Stock', 'Unidad']],
-                         hide_index=True, use_container_width=True)
+            st.dataframe(bajo_stock[["Ingrediente", "Stock", "Unidad"]], hide_index=True, use_container_width=True)
         else:
             st.success("Todos los insumos tienen stock suficiente.")
 
@@ -651,9 +840,9 @@ elif opid == "rep":
             import io
             buf_rep = io.BytesIO()
             df_descarga = bajo_stock if not bajo_stock.empty \
-                else st.session_state.ingredientes[['Ingrediente', 'Stock', 'Unidad']]
-            with pd.ExcelWriter(buf_rep, engine='xlsxwriter') as writer:
-                df_descarga.to_excel(writer, index=False, sheet_name='Reporte_Inventario')
+                else st.session_state.ingredientes[["Ingrediente", "Stock", "Unidad"]]
+            with pd.ExcelWriter(buf_rep, engine="xlsxwriter") as writer:
+                df_descarga.to_excel(writer, index=False, sheet_name="Reporte_Inventario")
 
             st.download_button(
                 label="Descargar Reporte de Inventario (Excel)",
@@ -666,7 +855,9 @@ elif opid == "rep":
     with col_der:
         st.write("### Top 5 Platos mas Rentables")
         if not st.session_state.recetas.empty:
-            top_platos = st.session_state.recetas.nlargest(5, 'Valor_Utilidad')
+            top_platos = st.session_state.recetas.copy()
+            top_platos["Valor_Utilidad"] = pd.to_numeric(top_platos["Valor_Utilidad"], errors="coerce")
+            top_platos = top_platos.nlargest(5, "Valor_Utilidad")
             st.bar_chart(data=top_platos, x="Plato", y="Valor_Utilidad", color="#2ecc71")
         else:
             st.info("No hay datos de recetas disponibles.")
@@ -675,9 +866,119 @@ elif opid == "rep":
     if not st.session_state.recetas.empty:
         with st.expander("Ver Detalle de Costeo"):
             df_rep_rec = st.session_state.recetas[
-                ['Plato', 'Costo_Total_Plato', 'Precio_Venta', 'Valor_Utilidad', 'Margen_Utilidad']
+                ["Plato", "Costo_Total_Plato", "Precio_Venta", "Valor_Utilidad", "Margen_Utilidad"]
             ].copy()
-            df_rep_rec['Margen %'] = (df_rep_rec['Margen_Utilidad'] * 100).round(2)
+            df_rep_rec["Margen %"] = (pd.to_numeric(df_rep_rec["Margen_Utilidad"], errors="coerce") * 100).round(2)
             st.dataframe(
-                df_rep_rec[['Plato', 'Costo_Total_Plato', 'Precio_Venta', 'Valor_Utilidad', 'Margen %']],
+                df_rep_rec[["Plato", "Costo_Total_Plato", "Precio_Venta", "Valor_Utilidad", "Margen %"]],
                 hide_index=True, use_container_width=True)
+
+# ════════════════════════════════════════════════════════════════════════════
+# 17. MÓDULO: GESTIÓN DE USUARIOS (solo Administrador)
+# ════════════════════════════════════════════════════════════════════════════
+
+elif opid == "usuarios":
+    if rol != "Administrador":
+        st.error("Acceso denegado.")
+        st.stop()
+
+    st.subheader("👥 Gestión de Usuarios")
+
+    tab_nuevo, tab_lista = st.tabs(["Agregar Usuario", "Ver / Gestionar Usuarios"])
+
+    with tab_nuevo:
+        st.markdown("### Crear nuevo usuario")
+        with st.form("f_nuevo_usuario", clear_on_submit=True):
+            nu_user = st.text_input("Nombre de usuario").lower().strip()
+            nu_pass = st.text_input("Contraseña", type="password")
+            nu_pass2 = st.text_input("Confirmar contraseña", type="password")
+            nu_rol  = st.selectbox("Rol", ["Administrador", "Supervisor", "Cocina"])
+
+            if st.form_submit_button("Crear Usuario"):
+                if not nu_user or not nu_pass:
+                    st.error("Complete todos los campos.")
+                elif nu_pass != nu_pass2:
+                    st.error("Las contraseñas no coinciden.")
+                elif nu_user in st.session_state.usuarios["Usuario"].str.lower().tolist():
+                    st.error("Ese nombre de usuario ya existe.")
+                else:
+                    nuevo_u = pd.DataFrame([{
+                        "Usuario": nu_user,
+                        "Password_Hash": hash_password(nu_pass),
+                        "Rol": nu_rol,
+                        "Activo": "True"
+                    }])
+                    st.session_state.usuarios = pd.concat(
+                        [st.session_state.usuarios, nuevo_u], ignore_index=True)
+                    guardar_parcial("usuarios")
+                    st.success(f"Usuario '{nu_user}' creado con rol {nu_rol}.")
+                    st.rerun()
+
+    with tab_lista:
+        st.markdown("### Usuarios registrados")
+        df_u = st.session_state.usuarios.copy()
+
+        if df_u.empty:
+            st.info("No hay usuarios.")
+        else:
+            for idx, row in df_u.iterrows():
+                es_actual = row["Usuario"].lower() == st.session_state.usuario_actual.lower()
+                estado = "✅ Activo" if str(row["Activo"]).lower() == "true" else "❌ Inactivo"
+                with st.expander(f"👤 {row['Usuario']} | {row['Rol']} | {estado}"):
+                    col_a, col_b, col_c = st.columns(3)
+
+                    # Cambiar contraseña
+                    with col_a:
+                        with st.form(f"cambiar_pwd_{idx}"):
+                            nueva_pwd = st.text_input("Nueva contraseña", type="password", key=f"np_{idx}")
+                            if st.form_submit_button("Cambiar Contraseña"):
+                                if nueva_pwd:
+                                    st.session_state.usuarios.at[idx, "Password_Hash"] = hash_password(nueva_pwd)
+                                    guardar_parcial("usuarios")
+                                    st.success("Contraseña actualizada.")
+                                    st.rerun()
+
+                    # Cambiar rol
+                    with col_b:
+                        with st.form(f"cambiar_rol_{idx}"):
+                            roles = ["Administrador", "Supervisor", "Cocina"]
+                            rol_actual_u = row["Rol"] if row["Rol"] in roles else "Cocina"
+                            nuevo_rol = st.selectbox("Cambiar Rol", roles,
+                                                     index=roles.index(rol_actual_u),
+                                                     key=f"nr_{idx}")
+                            if st.form_submit_button("Actualizar Rol"):
+                                st.session_state.usuarios.at[idx, "Rol"] = nuevo_rol
+                                guardar_parcial("usuarios")
+                                st.success("Rol actualizado.")
+                                st.rerun()
+
+                    # Activar/Desactivar/Eliminar
+                    with col_c:
+                        if not es_actual:
+                            activo_actual = str(row["Activo"]).lower() == "true"
+                            lbl_toggle = "Desactivar" if activo_actual else "Activar"
+                            if st.button(lbl_toggle, key=f"tog_{idx}"):
+                                st.session_state.usuarios.at[idx, "Activo"] = str(not activo_actual)
+                                guardar_parcial("usuarios")
+                                st.rerun()
+
+                            if f"conf_del_u_{idx}" not in st.session_state:
+                                st.session_state[f"conf_del_u_{idx}"] = False
+
+                            if not st.session_state[f"conf_del_u_{idx}"]:
+                                if st.button("🗑️ Eliminar", key=f"pre_del_u_{idx}", type="secondary"):
+                                    st.session_state[f"conf_del_u_{idx}"] = True
+                                    st.rerun()
+                            else:
+                                st.warning("¿Confirma eliminar este usuario?")
+                                c_si, c_no = st.columns(2)
+                                if c_si.button("Sí, eliminar", key=f"si_del_u_{idx}"):
+                                    st.session_state.usuarios = st.session_state.usuarios.drop(idx).reset_index(drop=True)
+                                    guardar_parcial("usuarios")
+                                    st.session_state[f"conf_del_u_{idx}"] = False
+                                    st.rerun()
+                                if c_no.button("Cancelar", key=f"no_del_u_{idx}"):
+                                    st.session_state[f"conf_del_u_{idx}"] = False
+                                    st.rerun()
+                        else:
+                            st.info("(usuario actual)")
