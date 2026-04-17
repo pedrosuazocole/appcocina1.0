@@ -982,3 +982,11 @@ elif opid == "usuarios":
                                     st.rerun()
                         else:
                             st.info("(usuario actual)")
+# ════════════════════════════════════════════════════════════════════════════
+# 18. VERIFICAR CONEXION (solo Administrador)
+# ════════════════════════════════════════════════════════════════════════════
+ss = get_spreadsheet()
+if ss is None:
+    st.error("❌ No se pudo conectar a Google Sheets. Revisa secrets.toml")
+else:
+    st.success(f"✅ Conectado a: {ss.title}")
